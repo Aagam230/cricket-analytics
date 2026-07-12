@@ -69,10 +69,12 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for a detailed folder-by-fold
 
 ## 📊 Dataset
 
-This project uses publicly available IPL datasets, typically sourced from:
+This project uses a real-world IPL ball-by-ball dataset covering every season from 2007/08 through 2025, sourced from Kaggle ("IPL Complete Dataset, updated through 2025"):
 
-- [Kaggle: IPL Complete Dataset (2008–2024)](https://www.kaggle.com/) — `matches.csv` (match-level data) and `deliveries.csv` (ball-by-ball data)
-- [Cricsheet.org](https://cricsheet.org/) — ball-by-ball data in YAML/CSV format, as an alternative/supplementary source
+- `data/raw/matches.csv` — one row per match (1,169 matches), including season, venue, teams, toss, result, and umpires.
+- `data/raw/deliveries.csv` — one row per ball bowled (~278,000 deliveries), including batter/bowler, runs, extras breakdown (wide/no-ball/bye/leg-bye/penalty), and dismissals.
+
+Unlike an earlier version of this project, **this dataset does not ship separate `players.csv` or `seasons.csv` files** — player rosters and season summaries are derived automatically from the match and ball-by-ball data during preprocessing (`src/data/preprocess.py::derive_players()` / `derive_seasons()`). This means player metadata such as nationality, batting/bowling style, playing role, and auction price is **not available** in this version, since it doesn't exist anywhere in the source data.
 
 Raw data is **not committed to this repository** (see `.gitignore`); instructions for downloading it are in [`docs/INSTALLATION.md`](docs/INSTALLATION.md).
 
@@ -90,9 +92,11 @@ Five classification models are trained and compared on engineered match features
 | Gradient Boosting | Sequential error correction, strong baseline performance |
 | XGBoost | Industry-standard gradient boosting, typically best performance |
 
-Models are evaluated with accuracy, precision, recall, F1, ROC-AUC, confusion matrices, and k-fold cross-validation. The best-performing model (by cross-validated F1/ROC-AUC) is automatically selected and persisted to `models/`.
+Models are evaluated with accuracy, precision, recall, F1, ROC-AUC, confusion matrices, and k-fold cross-validation. The best-performing model (by cross-validated F1) is automatically selected and persisted to `models/`.
 
-Full details in [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md) (to be added once training is complete).
+**Evaluation methodology:** the test set is a **time-based split** — the most recent ~20% of matches, chronologically — rather than a random sample, since a model meant to predict *future* matches shouldn't be scored on its ability to predict matches from a decade before its "test" data. This is more honest but also harder: cross-validated F1 sits around 0.51–0.53 and test-set ROC-AUC hovers close to 0.5 for most models. That's a genuine finding, not a bug — pre-match features (teams, venue, toss, historical form) capture only part of what decides an IPL match; a large share of the outcome is determined by what happens *during* the game (which this feature set intentionally excludes to avoid leakage).
+
+Full methodology, per-model metrics tables, and an honest discussion of why performance sits where it does: [`docs/MODEL_CARD.md`](docs/MODEL_CARD.md) (also summarized in the in-app **About** page).
 
 ---
 

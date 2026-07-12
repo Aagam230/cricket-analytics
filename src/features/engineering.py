@@ -21,15 +21,58 @@ Design principle -- NO LEAKAGE:
 
 Engineered features (all leakage-safe, all relative to a single team
 appearing as either team1 or team2 in a given match):
-    - career win percentage prior to this match
+    - career win percentage prior to this match (RECENCY-WEIGHTED -- see
+      the 2026-07-10 tuning note below)
     - recent-form win percentage (last 5 matches) prior to this match
-    - venue win percentage prior to this match (this team, this venue)
+    - venue win percentage prior to this match (this team, this venue --
+      SHRUNK toward career win pct for small samples, see tuning note)
     - head-to-head win percentage prior to this match (this team vs this
-      specific opponent)
+      specific opponent, RECENCY-WEIGHTED)
     - number of career matches played prior to this match (lets the model
       learn to trust the above percentages more once they're based on a
       reasonable sample size, and lets cold-start rows -- where a team has
       no history -- be handled with a neutral 0.5 default)
+    - team1-vs-team2 DIFFERENTIAL versions of the career/recent/venue win
+      percentages (see tuning note)
+
+------------------------------------------------------------------------
+2026-07-10 FEATURE TUNING NOTE
+------------------------------------------------------------------------
+Three changes were made after reviewing initial model performance
+(ROC-AUC ~0.53-0.61, barely above chance for some models), aimed at the
+biggest identified source of noise: IPL squads turn over substantially
+every season via trades/auctions, so a flat, all-time "career win %" mixes
+in performance from a roster that may no longer resemble the current team.
+
+    1. RECENCY WEIGHTING (`career_win_pct`, `h2h_team1_win_pct`): switched
+       from a flat expanding mean over ALL prior matches to an
+       exponentially decayed mean (`CAREER_FORM_HALFLIFE` / `H2H_HALFLIFE`
+       matches), so recent matches (closer to the current squad) count
+       more than matches from 10 seasons ago, without discarding long-run
+       history entirely via a hard cutoff.
+    2. SHRINKAGE (`venue_win_pct`): a team with 2 prior matches at a venue
+       used to get a venue win% treated with the same confidence as a team
+       with 40 -- now shrunk toward that team's career win pct, weighted
+       by sample size (`VENUE_SHRINKAGE_K`), so small samples regress
+       toward a more reliable prior instead of contributing noisy extremes
+       (e.g. 1-for-1 = 100%).
+    3. DIFFERENTIAL FEATURES (`diff_career_win_pct`, `diff_recent_win_pct`,
+       `diff_venue_win_pct`): added explicit team1-minus-team2 versions of
+       the three main win-pct features, so models (especially Logistic
+       Regression) don't have to infer the difference between two
+       separate columns themselves.
+
+`compute_live_features()` mirrors all three changes for inference-time
+consistency (see its docstring) -- training and prediction must compute
+these statistics the same way, or the model would be scored on features
+subtly different from what it learned on.
+
+`city_enc` was also DROPPED from the feature set: it's almost entirely
+redundant with `venue_enc` (each venue has one city) and was judged more
+likely to add encoding noise than signal, especially given the modest
+training-set size (~1,150 matches). `city` itself is retained on the
+cleaned matches DataFrame for display/analytics purposes -- only the
+model-input encoding was removed.
 
 Usage:
     from src.features.engineering import build_model_dataset
@@ -66,6 +109,26 @@ RECENT_FORM_WINDOW: int = 5
 # assume even odds" rather than biasing the model toward 0 or 1.
 NEUTRAL_WIN_RATE: float = 0.5
 
+# --- 2026-07-10 tuning constants (see module docstring) ---
+# Halflife, in matches, for the exponential decay applied to career win
+# pct: a result from CAREER_FORM_HALFLIFE matches ago carries half the
+# weight of the most recent match. ~30 matches is roughly one IPL season,
+# so this keeps the current season's squad performance dominant while
+# still drawing on multi-season history for teams with limited recent data.
+CAREER_FORM_HALFLIFE: float = 30.0
+
+# Halflife, in head-to-head MEETINGS (not matches), for head-to-head win
+# pct decay. Meetings between two specific teams are much rarer than a
+# team's overall matches (a few per season at most), so the halflife is
+# expressed in a much smaller unit.
+H2H_HALFLIFE: float = 6.0
+
+# Shrinkage strength (in "equivalent prior matches") for venue win pct:
+# a team's venue record is blended with its career win pct, weighted as
+# if the career win pct were based on this many additional venue matches.
+# Higher K = more shrinkage toward the career rate for small venue samples.
+VENUE_SHRINKAGE_K: float = 5.0
+
 # The final, ordered list of feature columns fed into every model. Centralized
 # here so train.py, evaluate.py, and predict.py always agree on column order.
 FEATURE_COLUMNS: list[str] = [
@@ -74,16 +137,17 @@ FEATURE_COLUMNS: list[str] = [
     "team1_enc",
     "team2_enc",
     "venue_enc",
-    "city_enc",
     "toss_decision_enc",
     "toss_winner_is_team1",
-    "is_day_night",
     "team1_career_win_pct",
     "team2_career_win_pct",
+    "diff_career_win_pct",
     "team1_recent_win_pct",
     "team2_recent_win_pct",
+    "diff_recent_win_pct",
     "team1_venue_win_pct",
     "team2_venue_win_pct",
+    "diff_venue_win_pct",
     "team1_matches_played",
     "team2_matches_played",
     "h2h_team1_win_pct",
@@ -94,7 +158,41 @@ TARGET_COLUMN: str = "team1_wins"
 
 # Categorical columns that get LabelEncoder-encoded and persisted so the
 # exact same encoding is reused at inference time in predict.py.
-CATEGORICAL_ENCODERS: list[str] = ["team1", "team2", "venue", "city", "toss_decision"]
+# NOTE: "city" was removed (2026-07-10 tuning) -- see module docstring.
+CATEGORICAL_ENCODERS: list[str] = ["team1", "team2", "venue", "toss_decision"]
+
+
+def _decayed_win_pct(is_winner: pd.Series, halflife: float) -> float:
+    """
+    Compute an exponentially recency-weighted win percentage over a
+    chronologically-ordered (oldest-first) series of 1/0 win indicators,
+    used at INFERENCE time (`compute_live_features()`) to mirror the
+    decay-weighted statistics computed during training.
+
+    The most recent entry gets weight 1.0; an entry `halflife` matches
+    older gets weight 0.5; one `2 * halflife` matches older gets weight
+    0.25; and so on. This is the same weighting scheme
+    `pandas.Series.ewm(halflife=...)` applies internally, reimplemented
+    here as a plain weighted average so it can be reused directly against
+    an arbitrary already-materialized sub-series (e.g. a team's matches
+    against one specific opponent) without going through a groupby.
+
+    Args:
+        is_winner: Series of 1/0 (or bool) win indicators, oldest first.
+        halflife: Number of entries after which a result's weight halves.
+
+    Returns:
+        Weighted mean win rate (float), or `NEUTRAL_WIN_RATE` if the
+        series is empty.
+    """
+    if is_winner.empty:
+        return NEUTRAL_WIN_RATE
+    n = len(is_winner)
+    # Position 0 (oldest) gets the largest exponent (least weight);
+    # position n-1 (most recent) gets exponent 0 (full weight 1.0).
+    ages = np.arange(n - 1, -1, -1)
+    weights = 0.5 ** (ages / halflife)
+    return float(np.average(is_winner.astype(float), weights=weights))
 
 
 def _build_team_match_log(matches_df: pd.DataFrame) -> pd.DataFrame:
@@ -136,47 +234,66 @@ def _build_team_match_log(matches_df: pd.DataFrame) -> pd.DataFrame:
 def _add_rolling_team_stats(log: pd.DataFrame) -> pd.DataFrame:
     """
     Compute leakage-safe, per-team rolling statistics on the long-format
-    team match log: career win pct, recent-form win pct, venue win pct,
-    and career matches played -- each using only matches strictly before
-    the current row's match (via `.shift(1)` inside each team's group).
+    team match log: career win pct (recency-weighted), recent-form win
+    pct, venue win pct (shrunk toward career win pct), and career matches
+    played -- each using only matches strictly before the current row's
+    match (via `.shift(1)` inside each team's group).
 
     Args:
         log: Output of `_build_team_match_log()`.
 
     Returns:
-        The same long-format DataFrame with four additional columns:
-        `career_win_pct`, `recent_win_pct`, `venue_win_pct`, `matches_played`.
+        The same long-format DataFrame with additional columns:
+        `matches_played`, `career_win_pct`, `recent_win_pct`,
+        `venue_matches_played`, `venue_win_pct`.
     """
     log = log.copy()
 
     grouped_team = log.groupby("team", group_keys=False)["is_winner"]
 
-    # Career win pct prior to this match = expanding mean of all PRIOR
-    # results for this team. shift(1) excludes the current row.
+    # Career matches played prior to this match = count of PRIOR rows for
+    # this team (cumcount is naturally "prior count", no shift needed).
     log["matches_played"] = grouped_team.cumcount()
+
+    # Career win pct prior to this match = EXPONENTIALLY DECAYED expanding
+    # mean of all PRIOR results for this team (2026-07-10 tuning: was a
+    # flat expanding mean; see module docstring). shift(1) excludes the
+    # current row; ewm(halflife=...) down-weights older results so a
+    # team's current-season roster dominates its own "career" rate.
     log["career_win_pct"] = (
-        grouped_team.apply(lambda s: s.shift(1).expanding().mean()).reset_index(level=0, drop=True)
+        grouped_team.apply(
+            lambda s: s.shift(1).ewm(halflife=CAREER_FORM_HALFLIFE, min_periods=1).mean()
+        ).reset_index(level=0, drop=True)
     )
+    log["career_win_pct"] = log["career_win_pct"].fillna(NEUTRAL_WIN_RATE)
 
     # Recent-form win pct = rolling mean of the last RECENT_FORM_WINDOW
-    # prior matches for this team.
+    # prior matches for this team -- a short, unweighted window capturing
+    # "hot/cold streak" form, distinct from the longer-run career rate.
     log["recent_win_pct"] = (
         log.groupby("team", group_keys=False)["is_winner"]
         .apply(lambda s: s.shift(1).rolling(window=RECENT_FORM_WINDOW, min_periods=1).mean())
         .reset_index(level=0, drop=True)
     )
+    log["recent_win_pct"] = log["recent_win_pct"].fillna(NEUTRAL_WIN_RATE)
 
-    # Venue win pct prior to this match = expanding mean of this team's
-    # prior results AT THIS SPECIFIC VENUE.
-    log["venue_win_pct"] = (
+    # Venue win pct prior to this match: raw prior wins/matches at this
+    # specific (team, venue), then SHRUNK toward this team's (already
+    # decay-weighted) career_win_pct, weighted by how many prior matches
+    # the team has actually played at this venue (2026-07-10 tuning --
+    # see module docstring). A team with 0 prior matches at a venue gets
+    # exactly its career_win_pct; a team with many prior matches there is
+    # increasingly dominated by its actual venue record.
+    log["venue_matches_played"] = log.groupby(["team", "venue"], group_keys=False).cumcount()
+    venue_wins_prior = (
         log.groupby(["team", "venue"], group_keys=False)["is_winner"]
-        .apply(lambda s: s.shift(1).expanding().mean())
+        .apply(lambda s: s.shift(1).expanding().sum())
         .reset_index(level=0, drop=True)
+        .fillna(0.0)
     )
-
-    # Cold-start handling: no prior history yet -> neutral 0.5.
-    for col in ("career_win_pct", "recent_win_pct", "venue_win_pct"):
-        log[col] = log[col].fillna(NEUTRAL_WIN_RATE)
+    log["venue_win_pct"] = (
+        venue_wins_prior + VENUE_SHRINKAGE_K * log["career_win_pct"]
+    ) / (log["venue_matches_played"] + VENUE_SHRINKAGE_K)
 
     return log
 
@@ -186,6 +303,14 @@ def _add_head_to_head_stats(matches_df: pd.DataFrame) -> pd.DataFrame:
     Compute, for every match, team1's historical win percentage against
     THIS SPECIFIC opponent (team2) prior to this match, plus the number of
     prior head-to-head meetings.
+
+    2026-07-10 tuning: `h2h_team1_win_pct` is now EXPONENTIALLY
+    RECENCY-WEIGHTED (halflife = `H2H_HALFLIFE` meetings, not matches --
+    see module docstring) rather than a flat average over the full
+    head-to-head history, for the same squad-turnover reasoning as
+    `career_win_pct`. `h2h_matches_played` remains a plain (undecayed)
+    count, since it's used by the model as a sample-size signal, not a
+    rate.
 
     Args:
         matches_df: Cleaned matches DataFrame, sorted chronologically.
@@ -201,20 +326,43 @@ def _add_head_to_head_stats(matches_df: pd.DataFrame) -> pd.DataFrame:
     h2h_win_pct = np.full(len(df), NEUTRAL_WIN_RATE, dtype=float)
     h2h_matches = np.zeros(len(df), dtype=int)
 
-    # pair_history[frozenset({teamA, teamB})] -> list of winners seen so far
-    pair_history: dict[frozenset, list[str]] = {}
+    # Exponential decay factor applied per meeting: a pair's accumulated
+    # weighted stats are multiplied by ALPHA every time a new meeting is
+    # recorded, which reproduces halflife-based decay incrementally
+    # (equivalent to `pandas.ewm(halflife=H2H_HALFLIFE)` but computed
+    # match-by-match, since -- unlike `career_win_pct` -- which side is
+    # "team1" can flip between two teams' meetings, so a single per-pair
+    # scalar can't be reused the way a per-team column can).
+    alpha = 0.5 ** (1.0 / H2H_HALFLIFE)
+
+    # pair_stats[frozenset({teamA, teamB})] -> {
+    #     "weighted_wins": {team_name: decayed win count, ...},
+    #     "weighted_matches": decayed total meeting count,
+    #     "raw_count": true (undecayed) meeting count,
+    # }
+    pair_stats: dict[frozenset, dict] = {}
 
     for i, row in enumerate(df.itertuples(index=False)):
         pair_key = frozenset({row.team1, row.team2})
-        history = pair_history.get(pair_key, [])
+        stats = pair_stats.get(pair_key)
 
-        h2h_matches[i] = len(history)
-        if history:
-            team1_wins_in_pair = sum(1 for w in history if w == row.team1)
-            h2h_win_pct[i] = team1_wins_in_pair / len(history)
+        if stats is not None and stats["weighted_matches"] > 0:
+            team1_weighted_wins = stats["weighted_wins"].get(row.team1, 0.0)
+            h2h_win_pct[i] = team1_weighted_wins / stats["weighted_matches"]
+        if stats is not None:
+            h2h_matches[i] = stats["raw_count"]
 
-        history.append(row.winner)
-        pair_history[pair_key] = history
+        if stats is None:
+            stats = {"weighted_wins": {}, "weighted_matches": 0.0, "raw_count": 0}
+
+        # Decay existing accumulated weight, then add this match's result.
+        stats["weighted_wins"] = {team: w * alpha for team, w in stats["weighted_wins"].items()}
+        stats["weighted_matches"] *= alpha
+        stats["weighted_wins"][row.winner] = stats["weighted_wins"].get(row.winner, 0.0) + 1.0
+        stats["weighted_matches"] += 1.0
+        stats["raw_count"] += 1
+
+        pair_stats[pair_key] = stats
 
     df["h2h_team1_win_pct"] = h2h_win_pct
     df["h2h_matches_played"] = h2h_matches
@@ -223,8 +371,8 @@ def _add_head_to_head_stats(matches_df: pd.DataFrame) -> pd.DataFrame:
 
 def _encode_categoricals(df: pd.DataFrame, fit: bool = True, encoders: dict | None = None) -> tuple[pd.DataFrame, dict]:
     """
-    Label-encode categorical columns (team1, team2, venue, city,
-    toss_decision) into integer columns suffixed `_enc`.
+    Label-encode categorical columns (team1, team2, venue, toss_decision)
+    into integer columns suffixed `_enc`.
 
     Args:
         df: DataFrame containing the raw categorical columns.
@@ -332,9 +480,18 @@ def build_model_dataset(save: bool = True) -> tuple[pd.DataFrame, pd.Series, lis
     ]
     df = df.merge(h2h, on="match_id", how="left")
 
+    # --- Differential features (2026-07-10 tuning; see module docstring) ---
+    df["diff_career_win_pct"] = df["team1_career_win_pct"] - df["team2_career_win_pct"]
+    df["diff_recent_win_pct"] = df["team1_recent_win_pct"] - df["team2_recent_win_pct"]
+    df["diff_venue_win_pct"] = df["team1_venue_win_pct"] - df["team2_venue_win_pct"]
+
     # --- Simple derived / pre-match-knowable columns ---
     df["toss_winner_is_team1"] = (df["toss_winner"] == df["team1"]).astype(int)
-    df["is_day_night"] = df["is_day_night"].astype(int)
+    # NOTE: `is_day_night` was dropped as a feature -- the new dataset has
+    # no day/night or match start-time field anywhere (see the migration
+    # note in src/utils/config.py). No replacement was substituted since
+    # there's no comparably meaningful pre-match-knowable alternative
+    # available in this dataset; the model simply has one fewer feature.
     df[TARGET_COLUMN] = (df["winner"] == df["team1"]).astype(int)
 
     # --- Categorical encoding ---
@@ -366,7 +523,6 @@ def compute_live_features(
     city: str,
     toss_winner: str,
     toss_decision: str,
-    is_day_night: bool,
     season: int,
     match_month: int,
     encoders: dict,
@@ -383,14 +539,36 @@ def compute_live_features(
     available (i.e. "as of today"), since a hypothetical match is assumed
     to occur after every match already in the dataset.
 
+    2026-07-10 tuning: this function mirrors the three changes made in
+    `_add_rolling_team_stats()` / `_add_head_to_head_stats()` (recency
+    weighting for career/h2h win pct, venue shrinkage, differential
+    features) -- see the module docstring. Training and inference MUST
+    compute these statistics the same way, or the model would be scored
+    on features subtly different from what it learned on. Concretely:
+        - `_team_snapshot()`'s career win pct now uses
+          `.ewm(halflife=CAREER_FORM_HALFLIFE).mean()` instead of a flat
+          `.mean()` (equivalent to the training-time decayed expanding
+          mean, evaluated at the most recent point -- i.e. "as of now").
+        - `_venue_snapshot()` now shrinks toward the team's career win pct
+          using `VENUE_SHRINKAGE_K`, matching the training-time formula
+          exactly.
+        - `_h2h_snapshot()` now uses `_decayed_win_pct()` (halflife =
+          `H2H_HALFLIFE` meetings) instead of a flat `.mean()`.
+        - `diff_career_win_pct` / `diff_recent_win_pct` /
+          `diff_venue_win_pct` are computed and included in the output row.
+        - `city_enc` is no longer produced (city was dropped from
+          `CATEGORICAL_ENCODERS`); the `city` argument is still accepted
+          for API compatibility and potential future/display use, but no
+          longer feeds into the model.
+
     Args:
         team1: Name of the first team (post `TEAM_NAME_MAPPING` normalization).
         team2: Name of the second team.
         venue: Venue name.
-        city: City name.
+        city: City name (accepted for API compatibility; not currently
+            used as a model feature -- see tuning note above).
         toss_winner: Name of the team that won the toss (must be team1 or team2).
         toss_decision: "bat" or "field".
-        is_day_night: Whether this is a day/night match.
         season: Season year to associate with the hypothetical match.
         match_month: Calendar month (1-12) to associate with the hypothetical match.
         encoders: Fitted LabelEncoders dict, as returned by `build_model_dataset()`
@@ -420,32 +598,40 @@ def compute_live_features(
     log = _build_team_match_log(matches_df)
 
     def _team_snapshot(team: str) -> tuple[float, float, int]:
-        """Career win pct, recent win pct, and matches played for `team`,
-        using ALL history available (i.e. as of "now")."""
+        """Recency-weighted career win pct, recent win pct, and matches
+        played for `team`, using ALL history available (i.e. as of "now").
+        The career figure uses the same ewm-decay weighting as training
+        (see 2026-07-10 tuning note above)."""
         team_log = log[log["team"] == team]
         if team_log.empty:
             return NEUTRAL_WIN_RATE, NEUTRAL_WIN_RATE, 0
-        career = team_log["is_winner"].mean()
+        career = team_log["is_winner"].ewm(halflife=CAREER_FORM_HALFLIFE, min_periods=1).mean().iloc[-1]
         recent = team_log["is_winner"].tail(RECENT_FORM_WINDOW).mean()
         played = len(team_log)
         return float(career), float(recent), int(played)
 
-    def _venue_snapshot(team: str, venue_name: str) -> float:
+    def _venue_snapshot(team: str, venue_name: str, career_pct: float) -> float:
+        """Venue win pct for `team` at `venue_name`, shrunk toward
+        `career_pct` by sample size -- matches the training-time shrinkage
+        formula exactly (see 2026-07-10 tuning note above)."""
         venue_log = log[(log["team"] == team) & (log["venue"] == venue_name)]
-        if venue_log.empty:
-            return NEUTRAL_WIN_RATE
-        return float(venue_log["is_winner"].mean())
+        n = len(venue_log)
+        wins = float(venue_log["is_winner"].sum())
+        return (wins + VENUE_SHRINKAGE_K * career_pct) / (n + VENUE_SHRINKAGE_K)
 
     def _h2h_snapshot(team_a: str, team_b: str) -> tuple[float, int]:
+        """Recency-weighted head-to-head win pct for `team_a` against
+        `team_b`, using the same decay halflife as training."""
         h2h_log = log[(log["team"] == team_a) & (log["opponent"] == team_b)]
         if h2h_log.empty:
             return NEUTRAL_WIN_RATE, 0
-        return float(h2h_log["is_winner"].mean()), int(len(h2h_log))
+        pct = _decayed_win_pct(h2h_log["is_winner"], H2H_HALFLIFE)
+        return pct, int(len(h2h_log))
 
     team1_career, team1_recent, team1_played = _team_snapshot(team1)
     team2_career, team2_recent, team2_played = _team_snapshot(team2)
-    team1_venue = _venue_snapshot(team1, venue)
-    team2_venue = _venue_snapshot(team2, venue)
+    team1_venue = _venue_snapshot(team1, venue, team1_career)
+    team2_venue = _venue_snapshot(team2, venue, team2_career)
     h2h_win_pct, h2h_played = _h2h_snapshot(team1, team2)
 
     row = {
@@ -457,13 +643,15 @@ def compute_live_features(
         "city": city,
         "toss_decision": toss_decision,
         "toss_winner_is_team1": int(toss_winner == team1),
-        "is_day_night": int(is_day_night),
         "team1_career_win_pct": team1_career,
         "team2_career_win_pct": team2_career,
+        "diff_career_win_pct": team1_career - team2_career,
         "team1_recent_win_pct": team1_recent,
         "team2_recent_win_pct": team2_recent,
+        "diff_recent_win_pct": team1_recent - team2_recent,
         "team1_venue_win_pct": team1_venue,
         "team2_venue_win_pct": team2_venue,
+        "diff_venue_win_pct": team1_venue - team2_venue,
         "team1_matches_played": team1_played,
         "team2_matches_played": team2_played,
         "h2h_team1_win_pct": h2h_win_pct,

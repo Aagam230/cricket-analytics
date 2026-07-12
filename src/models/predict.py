@@ -23,7 +23,6 @@ Usage:
         city="Mumbai",
         toss_winner="Mumbai Indians",
         toss_decision="bat",
-        is_day_night=True,
     )
     print(result["predicted_winner"], result["win_probability"])
 """
@@ -176,7 +175,6 @@ def predict_match(
     city: str,
     toss_winner: str,
     toss_decision: str,
-    is_day_night: bool = True,
     season: int | None = None,
     match_month: int | None = None,
 ) -> dict:
@@ -194,8 +192,6 @@ def predict_match(
         toss_winner: Name of the team that won the toss (must equal
             `team1` or `team2`).
         toss_decision: "bat" or "field" -- what the toss winner chose to do.
-        is_day_night: Whether this is a day/night (floodlit) match.
-            Defaults to True (the modal case in the historical data).
         season: Season year to associate with the hypothetical match.
             Defaults to the current calendar year if not given.
         match_month: Calendar month (1-12). Defaults to the current month
@@ -245,7 +241,6 @@ def predict_match(
         city=city,
         toss_winner=toss_winner,
         toss_decision=toss_decision,
-        is_day_night=is_day_night,
         season=season,
         match_month=match_month,
         encoders=encoders,
@@ -289,7 +284,6 @@ if __name__ == "__main__":
         city=demo_city,
         toss_winner=team_a,
         toss_decision="bat",
-        is_day_night=True,
     )
     print(f"{team_a} vs {team_b} @ {demo_venue}")
     print(f"Predicted winner: {result['predicted_winner']} ({result['win_probability']:.1%})")

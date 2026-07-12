@@ -46,22 +46,22 @@ pip install -r requirements.txt
 
 ## 5. Download the IPL dataset from Kaggle
 
-This project expects four CSV files in `data/raw/`:
+This project expects **two** CSV files in `data/raw/` — note that this is fewer than earlier versions of this project expected, since this dataset does not ship separate player-metadata or season-summary files (see the note below the table):
 
 | File | Description |
 |------|-------------|
-| `matches.csv` | One row per match: teams, venue, toss, winner, season, etc. |
-| `deliveries.csv` | One row per ball bowled: striker, non-striker, bowler, runs, wickets, etc. |
-| `players.csv` | One row per player: nationality, role, batting/bowling style, auction prices, career span. |
-| `seasons.csv` | One row per IPL season: champion, runner-up, orange/purple cap winners, aggregate stats. |
+| `matches.csv` | One row per match: `matchId`, `season`, `venue`, `city`, `team1`, `team2`, `toss_winner`, `toss_decision`, `winner`, `winner_runs`, `winner_wickets`, `outcome`, `player_of_match`, `umpire1`, `umpire2`, etc. |
+| `deliveries.csv` | One row per ball bowled: `matchId`, `inning`, `over`, `ball`, `batting_team`, `bowling_team`, `batsman`, `non_striker`, `bowler`, `batsman_runs`, `extras`, `isWide`/`isNoBall`/`Byes`/`LegByes`/`Penalty`, `dismissal_kind`, `player_dismissed`. |
 
-These come from the **IPL Complete Dataset (2008–2025, Enhanced Edition)** on Kaggle (`meruvakodandasuraj/ipl-complete-dataset-2008-2025-enhanced-edition`), which ships all four files with column names matching this pipeline's expectations out of the box. Other "IPL Complete Dataset" uploads may also work if they include all four files, since `src/utils/config.py` centralizes column-name mapping — but you may need to update the column constants there if a different version uses different headers.
+These come from the **IPL ball-by-ball dataset (updated through 2025)** on Kaggle. Other "IPL" dataset uploads may also work as long as they provide match-level and ball-by-ball CSVs, since `src/data/loader.py` centralizes the expected raw column names (`EXPECTED_MATCHES_COLUMNS` / `EXPECTED_DELIVERIES_COLUMNS`) and `src/data/preprocess.py` centralizes the raw-to-canonical translation — but you will need to update both if a different version uses different headers.
+
+> **No `players.csv` or `seasons.csv` needed.** Unlike an earlier version of this project, this dataset does not ship standalone player-metadata or season-summary files. Player rosters and season summaries are automatically **derived** from `matches.csv` + `deliveries.csv` during preprocessing (see `src/data/preprocess.py::derive_players()` / `derive_seasons()`) and written to `data/processed/players_clean.csv` / `seasons_clean.csv`. This means fields like player nationality, batting/bowling style, playing role, and auction price are **not available**, since that information doesn't exist anywhere in the source data — see the Dataset section of the main [`README.md`](../README.md) for details.
 
 ### Option A — Manual download (simplest)
 
-1. Go to Kaggle and search **"IPL Complete Dataset 2008-2025 Enhanced Edition"** (or use the link above).
+1. Go to Kaggle and search for an **IPL ball-by-ball dataset covering 2008–2025** (e.g. "IPL Complete Dataset up to 2025").
 2. Download the dataset `.zip` file.
-3. Extract it and place `matches.csv`, `deliveries.csv`, `players.csv`, and `seasons.csv` directly into `data/raw/`.
+3. Extract it and place `matches.csv` and `deliveries.csv` directly into `data/raw/`. (If the download uses different filenames, such as `matches_updated_ipl_upto_2025.csv`, rename them to `matches.csv` and `deliveries.csv` respectively.)
 
 Your folder should look like:
 
@@ -69,14 +69,12 @@ Your folder should look like:
 data/raw/
 ├── matches.csv
 ├── deliveries.csv
-├── players.csv
-├── seasons.csv
 └── .gitkeep
 ```
 
 ### Option B — Kaggle CLI (recommended for reproducibility)
 
-1. Install the Kaggle CLI (already in `requirements.txt` is *not* included by default — install separately if you want this route):
+1. Install the Kaggle CLI (not included in `requirements.txt` by default — install separately if you want this route):
 
    ```bash
    pip install kaggle
@@ -96,31 +94,35 @@ data/raw/
 
    > ⚠️ **Never commit `kaggle.json` to Git.** It contains a secret API key. This repo's `.gitignore` does not reference it directly, so be careful to keep it outside the project folder or add `kaggle.json` to your global gitignore.
 
-4. Download and unzip the dataset directly into `data/raw/`:
+4. Download the dataset directly into `data/raw/`, then rename the files to match what this pipeline expects:
 
    ```bash
-   kaggle datasets download -d meruvakodandasuraj/ipl-complete-dataset-2008-2025-enhanced-edition -p data/raw --unzip
+   kaggle datasets download -d <dataset-owner>/<dataset-slug> -p data/raw --unzip
+   mv data/raw/matches_updated_ipl_upto_2025.csv data/raw/matches.csv
+   mv data/raw/deliveries_updated_ipl_upto_2025.csv data/raw/deliveries.csv
    ```
+
+   (Adjust the source filenames above to whatever your specific Kaggle download actually names them.)
 
 5. Verify the files landed correctly:
 
    ```bash
    ls data/raw/
-   # Expect: matches.csv  deliveries.csv  players.csv  seasons.csv  .gitkeep
+   # Expect: matches.csv  deliveries.csv  .gitkeep
    ```
 
 ### Option C — Cricsheet.org (alternative source)
 
-[Cricsheet](https://cricsheet.org/) provides free ball-by-ball cricket data in YAML/JSON/CSV formats, including IPL matches, as an alternative or supplement to Kaggle. If you use Cricsheet data instead, you may need to adapt column names in `src/utils/config.py` to match Cricsheet's schema, since it differs slightly from the Kaggle format this project is built around.
+[Cricsheet](https://cricsheet.org/) provides free ball-by-ball cricket data in YAML/JSON/CSV formats, including IPL matches, as an alternative or supplement to Kaggle. If you use Cricsheet data instead, you will need to adapt `EXPECTED_MATCHES_COLUMNS` / `EXPECTED_DELIVERIES_COLUMNS` in `src/data/loader.py` and the corresponding renaming logic in `src/data/preprocess.py` to match Cricsheet's schema, since it differs from the Kaggle format this project is built around.
 
 ---
 
 ## 6. Run the pipeline
 
-Once `matches.csv`, `deliveries.csv`, `players.csv`, and `seasons.csv` are in `data/raw/`:
+Once `matches.csv` and `deliveries.csv` are in `data/raw/`:
 
 ```bash
-# Clean and preprocess raw data
+# Clean and preprocess raw data (also derives players_clean.csv and seasons_clean.csv)
 python -m src.data.preprocess
 
 # Train and compare ML models
@@ -138,10 +140,11 @@ The app will open automatically in your browser at `http://localhost:8501`.
 
 | Problem | Likely cause / fix |
 |---------|----------------------|
-| `FileNotFoundError: data/raw/matches.csv` | Dataset not downloaded yet — see Step 5 above. |
+| `FileNotFoundError: data/raw/matches.csv` | Dataset not downloaded yet, or files weren't renamed to `matches.csv`/`deliveries.csv` — see Step 5 above. |
 | `ModuleNotFoundError: No module named 'src'` | Run scripts from the project root, not from inside `src/`, so Python can resolve the `src` package. |
 | Kaggle CLI `401 Unauthorized` | Your `kaggle.json` token is missing, expired, or in the wrong location (`~/.kaggle/kaggle.json`). |
-| Column name errors during preprocessing | Your Kaggle dataset version uses different column names than expected — check `src/utils/config.py` and update the column constants to match your CSV headers. |
+| `DataValidationError: matches.csv is missing expected columns` | Your dataset version uses different column names than expected — check `EXPECTED_MATCHES_COLUMNS` / `EXPECTED_DELIVERIES_COLUMNS` in `src/data/loader.py` and update them (plus the renaming logic in `src/data/preprocess.py`) to match your actual CSV headers. |
+| `ModuleNotFoundError: No module named 'xgboost'` (during `python -m src.models.train`) | Optional dependency — `pip install xgboost`. Training still works without it; XGBoost is simply skipped from the model comparison. |
 
 ---
 

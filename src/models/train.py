@@ -40,7 +40,12 @@ from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
-from xgboost import XGBClassifier
+
+try:
+    from xgboost import XGBClassifier
+    _XGBOOST_AVAILABLE = True
+except ImportError:  # pragma: no cover - environment-dependent
+    _XGBOOST_AVAILABLE = False
 
 from src.features.engineering import FEATURE_COLUMNS, build_model_dataset
 from src.models.evaluate import evaluate_model
@@ -74,9 +79,11 @@ def get_candidate_models() -> dict[str, object]:
 
     Returns:
         Dict mapping a human-readable model name to an unfitted
-        scikit-learn / XGBoost estimator instance.
+        scikit-learn / XGBoost estimator instance. XGBoost is omitted if
+        the `xgboost` package is not installed in the current environment
+        (logged as a warning rather than crashing the whole pipeline).
     """
-    return {
+    candidates: dict[str, object] = {
         "Logistic Regression": Pipeline([
             ("scaler", StandardScaler()),
             ("clf", LogisticRegression(
@@ -102,7 +109,9 @@ def get_candidate_models() -> dict[str, object]:
             learning_rate=0.05,
             random_state=RANDOM_SEED,
         ),
-        "XGBoost": XGBClassifier(
+    }
+    if _XGBOOST_AVAILABLE:
+        candidates["XGBoost"] = XGBClassifier(
             n_estimators=300,
             max_depth=4,
             learning_rate=0.05,
@@ -111,8 +120,14 @@ def get_candidate_models() -> dict[str, object]:
             eval_metric="logloss",
             random_state=RANDOM_SEED,
             n_jobs=-1,
-        ),
-    }
+        )
+    else:
+        logger.warning(
+            "xgboost is not installed in this environment -- skipping the "
+            "XGBoost candidate model. Install it (`pip install xgboost`) to "
+            "include it in the comparison."
+        )
+    return candidates
 
 
 def cross_validate_model(model, X_train: pd.DataFrame, y_train: pd.Series) -> dict[str, float]:
@@ -145,10 +160,10 @@ def cross_validate_model(model, X_train: pd.DataFrame, y_train: pd.Series) -> di
     return summary
 
 
-def train_and_compare_models(save: bool = True) -> dict:
+def train_and_compare_models(save: bool = True, time_based_split: bool = True) -> dict:
     """
     End-to-end training pipeline: build features, split train/test,
-    cross-validate and fit all five candidate models, evaluate each on the
+    cross-validate and fit all candidate models, evaluate each on the
     held-out test set, select the best model by cross-validated F1 score,
     and persist the best model + run metadata to disk.
 
@@ -156,6 +171,20 @@ def train_and_compare_models(save: bool = True) -> dict:
         save: If True (default), persist the best model to
             `BEST_MODEL_PATH` and a JSON summary of every model's results
             to `MODEL_METADATA_PATH`.
+        time_based_split: If True (default, changed 2026-07-10), the test
+            set is the most recent `TEST_SIZE` fraction of matches in
+            chronological order, rather than a random stratified sample.
+            This is the more honest evaluation for a model meant to
+            predict FUTURE matches: a random split can train on 2024 data
+            and test on 2009 data, which doesn't reflect how the model
+            would actually be used (predicting seasons it hasn't seen
+            yet). Set to False to reproduce the old random-stratified-split
+            behavior (e.g. for comparison, or if the dataset is too small
+            for a clean chronological split to leave enough test examples).
+            Note that `build_model_dataset()` already returns matches in
+            chronological order (matches.csv is sorted by season/date
+            during preprocessing), so a simple positional split is
+            sufficient here -- no re-sorting needed.
 
     Returns:
         Dict with keys:
@@ -166,6 +195,10 @@ def train_and_compare_models(save: bool = True) -> dict:
             "feature_columns": list of feature column names used.
             "test_set": (X_test, y_test) tuple, useful for downstream
                 evaluation/visualization without retraining.
+            "time_based_split": the value of `time_based_split` used for
+                this run, recorded so downstream consumers (e.g. the
+                Streamlit Model Performance page) know how to interpret
+                the test metrics.
 
     Example:
         >>> run = train_and_compare_models()
@@ -180,13 +213,23 @@ def train_and_compare_models(save: bool = True) -> dict:
 
     X, y, feature_names, _encoders = build_model_dataset(save=True)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
-    )
-    logger.info(
-        f"Train/test split: {X_train.shape[0]:,} train rows, "
-        f"{X_test.shape[0]:,} test rows (test_size={TEST_SIZE})."
-    )
+    if time_based_split:
+        split_idx = int(len(X) * (1 - TEST_SIZE))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        logger.info(
+            f"Time-based split: {X_train.shape[0]:,} train rows (earliest "
+            f"matches), {X_test.shape[0]:,} test rows (most recent "
+            f"matches, test_size={TEST_SIZE})."
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=TEST_SIZE, random_state=RANDOM_SEED, stratify=y
+        )
+        logger.info(
+            f"Random stratified split: {X_train.shape[0]:,} train rows, "
+            f"{X_test.shape[0]:,} test rows (test_size={TEST_SIZE})."
+        )
 
     candidates = get_candidate_models()
     results: dict[str, dict] = {}
@@ -240,6 +283,7 @@ def train_and_compare_models(save: bool = True) -> dict:
             "train_rows": int(X_train.shape[0]),
             "test_rows": int(X_test.shape[0]),
             "test_size": TEST_SIZE,
+            "time_based_split": time_based_split,
             "cv_folds": CV_FOLDS,
             "random_seed": RANDOM_SEED,
             "results": results,
@@ -262,6 +306,7 @@ def train_and_compare_models(save: bool = True) -> dict:
         "feature_columns": feature_names,
         "test_set": (X_test, y_test),
         "all_models": fitted_models,
+        "time_based_split": time_based_split,
     }
 
 
