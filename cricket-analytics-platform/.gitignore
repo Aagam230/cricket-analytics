@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+data/raw/*.csv
+data/processed/*.csv
+models/*.joblib
+models/*.json
+logs/*.log
+.DS_Store

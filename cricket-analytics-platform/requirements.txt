@@ -1,0 +1,31 @@
+# ============================================================
+# Cricket Analytics & Match Prediction Platform
+# Python dependencies (pinned for reproducibility)
+# Tested on Python 3.12
+# ============================================================
+
+# --- Core data handling ---
+pandas==2.2.2
+numpy==1.26.4
+
+# --- Machine learning ---
+scikit-learn==1.5.0
+xgboost==2.0.3
+joblib==1.4.2
+
+# --- Visualization ---
+matplotlib==3.8.4
+plotly==5.22.0
+seaborn==0.13.2
+
+# --- Web application ---
+streamlit==1.35.0
+
+# --- Utilities ---
+python-dotenv==1.0.1
+pyyaml==6.0.1
+
+# --- Code quality / dev tools (optional but recommended for portfolio) ---
+black==24.4.2
+flake8==7.0.0
+pytest==8.2.1
